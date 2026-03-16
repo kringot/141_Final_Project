@@ -1,0 +1,915 @@
+---
+title: "STA 141A:  Predicting Wildfire Incidence in the United States"
+author:  "Kristine Ngo"
+output: html_document
+---
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+- use chunk options in R or suppress method to hide messages and warnings
+- add an extra line after each code chunk (otherwise will be placed on same line as graph) -> will lose points
+- use backticks `` to refer to variables (eg `fire`)
+- label each table and figure
+- resize figure appropriately
+
+- once you get outputs (especially figures) interpret them in words
+- describe your model (eg equations) and state why you chose that model
+- may not lose points if model does not significantly outperform based model, but should include some insights if you have bad resutls
+
+## Overview
+
+The goal of this final project is to develop a prediction model for the incidence and location of notable wildfires in the United States ([link](https://www.kaggle.com/datasets/rtatman/188-million-us-wildfires/data)). You will use historical wildfire records to estimate the probability that a wildfire will occur in a given geographic area during a future month.
+
+A full modeling pipeline is expected, including:
+- Careful problem formulation and data preprocessing  
+- Exploratory analysis to motivate modeling choices  
+- Predictive modeling with appropriate validation  
+- Clear interpretation and communication of results  
+
+Students are expected to submit a final written report, organized according to the sections described below. Each student is expected to write their own reproducible report, but discussion is encouraged. 
+
+---
+
+
+## Data and background
+
+You can find and download a subset of historical wildfire records derived from the Kaggle dataset *“188 Million US Wildfires”*. The dataset includes wildfire ignition locations, discovery dates, containment dates, and final burned area across the contiguous United States. You are encouraged, but not required, to use the full dataset from the original source. 
+
+Wildfires vary widely in size, and the vast majority of recorded fires are very small and quickly contained. Modeling all recorded fires would lead to extreme class imbalance and would obscure the dynamics of fires that are operationally and scientifically meaningful.
+
+To address this, you may filter the raw wildfire records to retain only “notable” fires. A recommended cutoff is to retain only the wildfires with final burned area $\geq$ 300 acres.  This threshold is consistent with operational wildfire reporting standards used by U.S. fire management agencies, where *large wildland fires* are commonly defined as: $\geq$ 100 acres in timber fuel models, or  $\geq$ 300 acres in grass or brush fuel models  
+
+**Alternative Cutoffs.** You may choose an alternative cutoff  if you clearly justify your choice. Any alternative cutoff must be clearly justified in writing and applied consistently throughout the project.
+
+```{r}
+
+## open necessary packages _____________
+
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(DBI)
+library(RSQLite)
+library(lubridate)
+library(maps)
+library(ggrepel)
+library(zoo)
+library(tree)
+library(randomForest)
+library(pROC)
+library(rpart)
+
+## set upROC## set up dataset _____________________________________________________
+
+# connect R with the sqlite database using path 
+wf_con <- dbConnect(RSQLite::SQLite(), "C://Users//KN//Downloads//STA 141//FPA_FOD_20170508.sqlite")
+
+# assign all tables to a variable
+tables <- dbListTables(wf_con)
+# print out all tables within the sqlite
+tables
+
+# select the table you want into a tibble
+wf_fetus <- dbReadTable(wf_con, tables[2]) %>%
+  as_tibble()
+# check
+glimpse(wf_fetus)
+head(wf_fetus)
+
+# remove undesired identification columns
+wf <- wf_fetus %>%
+  dplyr::select(-1, -(3:19))
+# check
+glimpse(wf)
+head(wf)
+
+
+## identify and remove NA values ______________________________________
+
+# identify NA values from largest percentage
+wf %>%
+  # select only columns that have NA values
+  dplyr::select(where(anyNA)) %>%
+  # count number of NA values
+  summarise(
+    across(
+      everything(), 
+      ~ sum(is.na(.))
+    )
+  ) %>%
+  # change format of table for easier reading
+  pivot_longer(cols = everything(), 
+               names_to = "Column", 
+               values_to = "NA Count") %>%
+  # create new column to calculate percentages
+  mutate(
+    Percentage = `NA Count` / nrow(wf)
+  ) %>%
+  # order from largest percentage to lowest
+  arrange(desc(Percentage))
+
+# remove outliers
+wf <- wf %>%
+  drop_na()
+# check
+all(!is.na(wf))
+glimpse(wf)
+head(wf)
+
+## create column `MONTH` for the month when fire was discovered as a date data type 
+
+# create `FIRE_DATE` columns
+# `FIRE_DATE`: date (date data type) that the fire was discovered 
+FIRE_DATE <- as.Date(paste(wf$`FIRE_YEAR`, wf$`DISCOVERY_DOY`), format = "%Y %j")
+# check
+head(FIRE_DATE)
+
+# create `MONTH` column for the month fire was discovered
+MONTH <- month(FIRE_DATE)
+
+# add columns to dataset
+wf <- wf %>%
+  mutate(
+    `FIRE_DATE` = FIRE_DATE, 
+    `MONTH` = MONTH
+  )
+# check
+head(wf)
+
+# create `YEAR` column for the year fire was discovered
+wf$FIRE_YEAR <- year(`FIRE_DATE`)
+# check
+head(wf)
+
+```
+
+
+The Fire table in the sqlite databse contains data of wildfires from 1992 to 2015 in the United States. 
+
+The columns of the table from column 1 to 19 are different ways of identifying the wildfire. Whether it be from where the data was sourced from, or what the wildfire incident was recorded as in that particular source. For example, columns such as those starting with ICA and NWCG that represent what the wildfires are recorded as in different the ICA and NWCG databases. Many of these columns are majorily blank despite being filled in columns that contain quntifying variables (columns) that measure characteristics of the wildfires. In the content description, `FOD_ID` is written as the global unique identifier for each fire. This means that this column contains the original number of each wildfire, and that none will be left out. Choosing this column will prevent any wildfires to be left out due to being represented in only certain databases. Thus, it feels it would be best to select the `FOD_ID` represent the fire's identification. 
+
+The remaining eighteen columns will be removed from the dataset to prevent confusion and allow focus on the remaining columns.
+
+--- talk about removing `COMPLEX_NAME` because it is the name of the complex/location that is named due to the fire. There are other ways to identify the Wildfire, such as through coordinates. 
+
+--- talk about threshold for big fires
+
+--- talk about removing outliers
+
+--- talk about adding the `FIRE_DATE` column
+
+---
+
+## Prediction Task
+
+The prediction task is formulated as a binary classification problem with spatial and temporal structure.
+
+- **Outcome**  
+  For each spatial unit and month, define a binary variable indicating whether at least one notable wildfire occurs during that month.
+
+- **Spatial unit**  
+  You may choose an appropriate spatial unit (e.g., grid cells, counties, or other geographic partitions). The choice should balance spatial resolution, interpretability, and data sparsity. 
+
+- **Temporal unit**  
+  Month. You may refine your resolution to week or day with clear justification. 
+
+- **Predictors**  
+  You may select any variables in the dataset as your predictors. External data sources (e.g., weather or land cover) are allowed but not required.
+
+---
+
+
+
+## Report Structure and Required Sections
+
+
+Your final report must contain an **abstract** and the following **five** sections. 
+Each section should combine clear explanation, appropriate visual or tabular outputs, and interpretation. 
+
+You may add an optional Introduction or Background section to improve the exposition of the report. 
+
+
+### 1. Data Preprocessing
+
+This section should clearly explain how the raw wildfire data are transformed into the final dataset used for modeling.
+
+The report should explain
+- How notable fires are identified and filtered  
+- How space–time units are constructed (e.g., grid-by-month)  
+- How the binary outcome variable is defined  
+- How predictors are constructed or aggregated  
+- How missing data or edge cases are handled  
+
+**Minimum required output:** A summary table describing the final dataset used for predictive modeling. 
+
+--- talk about how because the data is so right skewed, need to apply log transformation to normalize the distribution and stabilize variance. 
+improve interpretability of model by making patterns more noticeable. reduce skewness by reducing effect of extreme values (outliers). The data had no zero values -> logarithmic transformation for heatmaps
+
+--- a log10 value of 2.xxx will lie between 100 and 1000 because log10(100) = 2 and log10(1000) = 3.
+
+--- talk about wildfire incidence. Wildfire incidence is the intensity and frequency of wildfires of a certain area over a certain amount of time. This measurement represents the impact of wildfires on its surroundings, including human communities. Wildfires can be caused by nature, the environment and human activity. 
+
+-- talk about how you wanted to measure annual median number and size of wildfires according to each state to give general idea of location.
+
+--- talk about how you measured fire intensity and frequency of each state faceted by each month. This is to show the variability of both the state and month variables, and why you chose them to be the space-time unit. 
+
+- talk about choosing predictors that are facts already known before the fire occurs. This means that columns such as `OWNER_CODE` and `STAT_CAUSE_CODE` are variables that are only known after the fire occurs, and therefore are not valid.
+
+--- talk about predictors: 
+  - `FIRE_OCC`: noteable fire occured in the month
+  - `PREV_1`: whether there was a fire (1) or not (0) in the previous month. 
+  - `PREV_3`: whether there was a fire (1) or not (0) in the past month.
+  - `AVG_LONG`: average longitude of where fire was located in state
+  - `AVG_LAT`: average latitude of where fire was located in state
+  
+```{r}
+
+## create histogram of intensity of fires to check the spread
+
+# create histogram
+ggplot(wf, mapping = aes(
+  x = `FIRE_SIZE`
+)) + 
+  geom_histogram(bins = 30) + 
+  labs(
+    title = "Sizes of Wildfires", 
+    x = "Size of Wildfires (Acres)", 
+    y = "Count"
+  )
+
+# create histogram of log-transformed data
+ggplot(wf, mapping = aes(
+  x = log10(`FIRE_SIZE`)
+)) + 
+  geom_histogram(bins = 30) + 
+  labs(
+    title = "Sizes of Wildfires", 
+    x = "Size of Wildfires (Acres)", 
+    y = "Count"
+  )
+
+## create histogram of frequency of fires to check the spread 
+
+# create histogram
+wf %>%
+  group_by(`STATE`) %>%
+  summarize(
+    `NUMBER` = n()
+  ) %>%
+  ggplot(wf, mapping = aes(
+    x = `NUMBER`
+  )) + 
+  geom_histogram() + 
+  labs(
+    title = "", 
+    x = "", 
+    y = ""
+  )
+
+# create histogram
+wf %>%
+  group_by(`STATE`) %>%
+  summarize(
+    `NUMBER` = n()
+  ) %>%
+  ggplot(wf, mapping = aes(
+    x = log10(`NUMBER`)
+  )) + 
+  geom_histogram(bins = 30) + 
+  labs(
+    title = "", 
+    x = "", 
+    y = ""
+  )
+
+```
+
+```{r}
+
+## create scatterplot of intensity vs frequency of wildfires ___________________________
+
+# prepare data for graphing
+wf_freq_int <- wf %>%
+  # group by state then year
+  # stacks grouping to prepare for second grouping
+  group_by(`STATE`, `MONTH`) %>%
+  summarize(
+    # count number of fires
+    `NUM_PER_MONTH` = n(), 
+    # find median size of fires per year
+    `MED_FIRE_SIZE_PER_MONTH` = median(`FIRE_SIZE`), 
+    .groups = "drop"
+  ) %>%
+  # group by state
+  group_by(`STATE`) %>%
+  summarize(
+    # find median number of fires per year
+    `MED_NUM_PER_STATE` = median(`NUM_PER_MONTH`), 
+    # find median size of fires per year
+    `MED_FIRE_SIZE_PER_STATE` = median(`MED_FIRE_SIZE_PER_MONTH`)
+  )
+# check
+head(wf_freq_int)
+
+# create scatterplot
+wf_freq_int %>%
+  ggplot(mapping = aes(
+    x = `MED_NUM_PER_STATE`, 
+    y = `MED_FIRE_SIZE_PER_STATE`, 
+    # color each state a different color to differentiate
+    color = `STATE`
+    )) + 
+  # hide legend
+  geom_point(show.legend = FALSE) + 
+  # separate the points and labels
+  geom_text_repel(mapping = aes(
+    # label each point by state
+    label = `STATE`
+  ), 
+  # hide legend
+  show.legend = FALSE, 
+  # set size of labels
+  size = 3) + 
+  # set labels
+  labs(
+    title = "Median Number vs Median Size of Wildfires of each State, Monthly", 
+    x = "Monthly Median Number of Wildfires", 
+    y = "Monthly Median Size of Wildfires (Acres)"
+  )
+
+```
+  
+  
+
+
+
+### 2. Exploratory Data Analysis  
+
+The purpose of this section is to build intuition about the data and to justify modeling decisions.
+
+You may explore questions such as
+
+- How does wildfire incidence vary across space?
+- How strong is seasonality?
+- How do predictors differ between fire and non-fire observations?
+- Are there trends over time?
+
+
+**Minimum required output:** The report should include at least **two** exploratory plots that demonstrate the spatial and temporal patterns of wildfires. Each plot should be accompanied by a brief interpretation.
+
+--- talk about how intensity and frequency that is shown in the heatmaps. To do this, you organizaed the data according to each state for each month, regardless of which year. Then, you considered frequency to be the amount of fires that occured in that state for each month. The heatmap shows that the western half typically have the most consistently throughout the year. There are some months outside of the middle months that show certain states in the bottom right or to left of the united states to have more wildfires. Talk about how you used median size of fires per state for each month to represent intensity. It appears that the middle states and bottom right states to have more coloring to them. 
+
+--- For seasonality, bring up how it is mostly apparent only in frequency of the wildfires. There are notable patterns there. 
+
+--- talk about boxplot when it comes to average lonogitude and latitude predictors and the fire and non-fire observatons. Talk about how they show differences in distributions across the different levels (0 and 1) for whether a notable fire occured or not.
+
+--- talk about the two bar charts.
+
+```{r}
+
+## create heatmap to show frequency of fires based on location_____________
+
+
+# prepare new dataset for graphing
+wf_freq <- wf %>%
+  mutate(
+    # set names to equal the states dataset
+    `STATE_LOWER` = tolower(state.name[match(`STATE`, state.abb)])
+  ) %>%
+  # filter out any na values
+  filter(!is.na(`STATE_LOWER`)) %>%
+  group_by(`STATE_LOWER`, `MONTH`) %>%
+  summarize(
+    # number of wildfires 
+    `NUM_FIRE` = n(), 
+    .groups = "drop"
+  )
+# check
+head(wf_freq)
+
+# load in us states data
+us_states <- map_data("state")
+# check
+glimpse(us_states)
+head(us_states)
+
+# combine graphing dataset and states dataset
+wf_freq_states <- left_join(us_states,  
+                              wf_freq, 
+                              by = c("region" = "STATE_LOWER")) %>%
+  filter(!is.na(`MONTH`)) %>%
+  arrange(order) 
+
+# check
+head(wf_freq_states)
+
+# plot heatmap of the us
+ggplot(data = wf_freq_states, mapping = aes(
+  x = long, 
+  y = lat, 
+  # create heatmap based on average fire size per state
+  fill = `NUM_FIRE`, 
+  group = group
+)) + 
+  # create general shape of the country
+  geom_polygon(color = "white") + 
+  scale_fill_viridis_c(option = "inferno", 
+                       # transform the data to bring out variation
+                       trans = "log10") + 
+  facet_wrap(~ `MONTH`) + 
+  # make graph look cleaner
+  theme_void() + 
+  # labels
+  labs(
+    title = "U.S. Heatmap of Number of Wildfires per State According to Months", 
+    # label the legend
+    fill = "Number of Wildfires (log10 transformed)",
+  )
+  
+
+## create heatmap to show intensity of fires based on location_____________
+
+# prepare new dataset for graphing
+wf_int <- wf %>% 
+  mutate(
+    # set names to equal the states dataset
+    `STATE_LOWER` = tolower(state.name[match(`STATE`, state.abb)])
+  ) %>%
+  # filter out any na values
+  filter(!is.na(`STATE_LOWER`)) %>%
+  group_by(`STATE_LOWER`, `MONTH`) %>%
+  summarize(
+    # number of wildfires 
+    `MED_FIRE_SIZE` = median(`FIRE_SIZE`), 
+    .groups = "drop"
+  )
+# check
+head(wf_int)
+
+# combine graphing dataset and states dataset
+wf_int_states <- left_join(us_states,  
+                              wf_int, 
+                              by = c("region" = "STATE_LOWER")) %>%
+  filter(!is.na(`MONTH`)) %>%
+  arrange(order) 
+
+# plot heatmap of the us
+ggplot(data = wf_int_states, mapping = aes(
+  x = long, 
+  y = lat, 
+  # create heatmap based on average fire size per state
+  fill = `MED_FIRE_SIZE`, 
+  group = group
+)) + 
+  # create general shape of the country
+  geom_polygon(color = "white") + 
+  scale_fill_viridis_c(option = "inferno", 
+                       # transform the data to bring out variation
+                       trans = "log10") + 
+  facet_wrap(~ `MONTH`) + 
+  # make graph look cleaner
+  theme_void() + 
+  # labels
+  labs(
+    title = "U.S. Heatmap of Median Size of Fires per State According to Months", 
+    # label the legend
+    fill = "Medin Size of Wildfires (log10 transformed)",
+  )
+
+```
+
+
+```{r}
+
+## create final dataset summary table
+
+# add column that considers if a fire is notable
+wf <- wf %>%
+  mutate(
+    `IS_NOTABLE` = if_else(`FIRE_SIZE` >= 300, 1, 0)
+  ) 
+# check
+head(wf)
+
+avg_long_lat <- wf %>%
+  group_by(`STATE`) %>%
+  summarize(
+    `AVG_LONG` = mean(`LONGITUDE`, na.rm = TRUE), 
+    `AVG_LAT` = mean(`LATITUDE`, na.rm = TRUE), 
+    .groups = "drop"
+  )
+# check
+head(avg_long_lat)
+
+# add new averages to dataset
+fetus_st_wf <- wf %>%
+  left_join(avg_long_lat, by = "STATE")
+# check
+head(wf)
+
+# create new dataset (grid) in space-time units of state for every month and year
+# `FIRE_OCC`: notable fire occured during the month
+st_wf <- fetus_st_wf %>%
+  group_by(`STATE`, `FIRE_YEAR`, `MONTH`, `AVG_LONG`, `AVG_LAT`) %>%
+  summarize(
+    FIRE_OCC = max(`IS_NOTABLE`, na.rm = TRUE), 
+    .groups = "drop"
+  )
+# check
+head(st_wf)
+
+# add columns for predictors `PREV_1` and `PREV_3`
+st_wf <- st_wf %>%
+  # arrange according to `STATE` -> `YEAR` -> `MONTH` to apply lag
+  arrange(`STATE`, `FIRE_YEAR`, `MONTH`) %>%
+  group_by(`STATE`) %>%
+  mutate(
+    PREV_1 = lag(`FIRE_OCC`, 1, default = 0), 
+    PREV_3 = rollapplyr(`FIRE_OCC`, width = 3, FUN = sum, fill = 0)
+  )  
+# check
+head(st_wf)
+
+## summary table of final dataset __________________________
+
+st_wf %>%
+  summarize(
+    # `TOT_FIRES` = total number of wildfires considered in final dataset
+    TOT_FIRES = n(), 
+    # `NOTABLE_FIRES` = total number of months with notable wildfires
+    NOTABLE_FIRES = sum(`FIRE_OCC`), 
+    # `NO_FIRES` = total number of months without notable wildfires
+    NO_FIRES = `TOT_FIRES` - `NOTABLE_FIRES`, 
+    AVG_LONG = mean(`AVG_LONG`), 
+    AVG_LAT = mean(`AVG_LAT`)
+  )
+    
+```
+
+```{r}
+
+## create graphs to explore relationship between predictors and notable fire and non-fire observations ________________________________
+
+# boxplot of `AVG_LONG` vs `FIRE_OCC`
+st_wf %>%
+  ggplot(mapping = aes(
+    x = as.factor(`FIRE_OCC`), 
+    y = `AVG_LONG`
+    )) + 
+  geom_boxplot() + 
+  scale_x_discrete(
+    labels = c(
+      "0" = "No Notable Wildfire", 
+      "1" = "Notable Wildfire"
+    )
+  ) +
+  labs(
+    title = "Average Longitude of Notable Wildfires by States", 
+    x = "", 
+    y = "Average Longitude (Degrees)"
+  )
+
+# boxplot of `AVG_LAT` vs `FIRE_OCC`
+st_wf %>%
+  ggplot(mapping = aes(
+    x = as.factor(`FIRE_OCC`), 
+    y = `AVG_LAT`
+    )) + 
+  geom_boxplot() + 
+  scale_x_discrete(
+    labels = c(
+      "0" = "No Notable Wildfire", 
+      "1" = "Notable Wildfire"
+    )
+  ) +
+  labs(
+    title = "Average Latitude of Notable Wildfires by States", 
+    x = "", 
+    y = "Average Latitude (Degrees)"
+  )
+
+# bar chart of `PREV_1` vs `FIRE_OCC`
+st_wf %>%
+  ggplot(mapping = aes(
+    x = as.factor(`PREV_1`), 
+    fill = as.factor(`FIRE_OCC`)
+  )) + 
+  geom_bar(position = "fill") + 
+  scale_x_discrete(
+    labels = c(
+      "0" = "No Notable Wildfire", 
+      "1" = "Notable Wildfire"
+    )) + 
+  scale_fill_manual(
+    values = c(
+      "0" = "lightblue", 
+      "1" = "pink"
+    ), 
+    labels = c(
+      "0" = "No Notable Wildfire", 
+      "1" = "Notable Wildfire"
+    )) + 
+  labs(
+    title = "Probability of Wildfire Due to Previous Month", 
+    x = "Wildfire Record of Previous Month", 
+    y = "Probability of Wildfire in Current Month", 
+    fill = "Result of Wildfire in Current Month"
+  )
+
+# bar chart of `PREV_3` vs `FIRE_OCC`
+st_wf %>%
+  ggplot(mapping = aes(
+    x = as.factor(`PREV_3`), 
+    fill = as.factor(`FIRE_OCC`)
+  )) + 
+  geom_bar(position = "fill") + 
+  scale_fill_manual(
+    values = c(
+      "0" = "lightblue", 
+      "1" = "pink"
+    ), 
+    labels = c(
+      "0" = "No Notable Wildfire", 
+      "1" = "Notable Wildfire"
+    )) + 
+  labs(
+    title = "Probability of Notable Wildfire Due to Previous 3 Months", 
+    x = "Number of Previous 3 Months that had a Notable Wildfire", 
+    y = "Probability of Wildfire in Current Month", 
+    fill = "Result of Wildfire in Current Month"
+  )
+
+```
+
+### 3. Modeling
+
+In this section, you will specify and justify the predictive models. You must fit at least **two** models:
+
+1. **Baseline model.** A simple and interpretable model (e.g., logistic regression) that establishes a performance benchmark. Attend discussion session to get code for this baseline model!
+
+2. **Model of your choice.** This is the model that you choose, after careful examination of the dataset. Ideally, your model should outperform the baseline model. 
+   
+**Minimum required output:** Description of both the baseline model and the model of your choice.
+- justify response and predictors
+- explain relationship under the model (equation or schematic)
+- for second model, provide reasons for choosing (eg non-linear pattern from EDA)
+
+-- baseline model has massive residual spikes in the residuals vs fitted plot. This is seen in the extreme Pearson residuals that exceed 100. The "curved" red line in the residuals vs fitted and scale-location plots should be flat. The dips and spikes in the line suggests a linear combination of the predictors are not capturing the full story.
+
+--- talk bout the variable importance plot
+
+--- talk bout the partial dependence plots (pdp) for each variable. as the value of `
+
+```{r}
+
+## fit the baseline model ________________________________
+
+# set up the data to be the training data
+wf_train <- st_wf %>%
+  filter(`FIRE_YEAR` <= 2010)
+
+# fit the training data into logistic regression
+wf_lg <- glm(`FIRE_OCC` ~ `PREV_1` + `PREV_3` + `AVG_LONG` + `AVG_LAT`, 
+             data = wf_train, 
+             family = "binomial")
+
+# see summary
+summary(wf_lg)
+
+# plot the model
+plot(wf_lg)
+
+## fit chosen model ______________________________________
+
+# fit the data into random forest model
+wf_rf <- randomForest(as.factor(`FIRE_OCC`) ~ `PREV_1` + `PREV_3` + `AVG_LONG` + `AVG_LAT`, 
+                      ntree = 200, 
+                      data = wf_train, 
+                      importance = TRUE)
+
+# plot the model
+plot(wf_rf)
+
+# plot variable importance plot
+varImpPlot(wf_rf, main = "Variable Importance for Wildfire Random Forest Model")
+
+# create partial dependence plot for `PREV_1`
+partialPlot(wf_rf, 
+            # set model results to data frame to prevent error
+            pred.data = as.data.frame(wf_train), 
+            x.var = "PREV_1", 
+            main = "Partial Dependence on Previous Month Wildfire Status")
+
+# create partial dependence plot for `PREV_3`
+partialPlot(wf_rf, 
+            # set model results to data frame to prevent error
+            pred.data = as.data.frame(wf_train), 
+            x.var = "PREV_3", 
+            main = "Partial Dependence on Previous Month Wildfire Status")
+
+# create partial dependence plot for `AVG_LONG`
+partialPlot(wf_rf, 
+            # set model results to data frame to prevent error
+            pred.data = as.data.frame(wf_train), 
+            x.var = "AVG_LONG", 
+            main = "Partial Dependence on Previous Month Wildfire Status")
+
+# create partial dependence plot for `AVG_LAT`
+partialPlot(wf_rf, 
+            # set model results to data frame to prevent error
+            pred.data = as.data.frame(wf_train), 
+            x.var = "AVG_LAT", 
+            main = "Partial Dependence on Previous Month Wildfire Status")
+
+```
+
+### 4. Model Fitting and Validation
+
+This section evaluates how well the models fit historical data and how they generalize over time. You need to use a proper validation method that respect the temporal structure. In other words, the model should avoid data leakage such as predicting outcomes in the past using models trained by future data. 
+
+The performance of the models should be evaluated by proper metrics. One required metric is the Area Under the ROC Curve (AUC). If AUC is not fully appropriate for your second model, you may include additional metrics, but AUC must still be reported for both models.
+
+
+**Minimum required output:** You must include at least one diagnostic plot (e.g., training loss over iterations, cross-validated AUC over time). 
+- appropriate train-test split scheme
+- appropriate time-area evaluation metric
+- correct fitting procedure and computing metric
+- compare with proper plots
+- justify why AUC better than other metrics
+  - two reasons
+
+
+
+```{r}
+
+## run test data to compare models 
+
+# split off the test data
+wf_test <- st_wf %>%
+  filter(`FIRE_YEAR` > 2010)
+# check
+head(wf_test)
+
+# predict probability using logistic regression model
+wf_lg_pred <- predict(wf_lg, 
+                      newdata = wf_test, 
+                      type = "response")
+
+# predict probability using random forest model
+wf_rf_pred <- predict(wf_rf, 
+                      newdata = wf_test,
+                      # want only a column
+                      type = "prob")[, "1"]
+
+# create roc
+wf_lg_roc <- roc(wf_test$FIRE_OCC, wf_lg_pred)
+wf_rf_roc <- roc(wf_test$FIRE_OCC, wf_rf_pred)
+
+# get the auc scores
+auc(wf_lg_roc)
+auc(wf_rf_roc)
+
+# plot comparison
+plot(wf_lg_roc,
+     col = "blue")
+plot(wf_rf_roc, 
+     col = "red", add = TRUE)
+
+
+```
+
+
+
+### 5. Summary
+
+This section summarizes the main findings and contributions of your project. You should summarize the key insights obtained from the exploratory data analysis and explain what your predictive model is able to capture. The discussion should be written for a general audience, emphasizing interpretation and practical understanding rather than technical detail.
+
+
+
+**Minimum required output:** Summary of EDA and model performance. 
+- plot line graph with lines for each model
+- interpret model
+
+
+--- The high residuals and non-linear patterns are a sign that the random forest is an ideal model for my chosen predictors. 
+
+--- talk about how the random forest model led to auc score that is lower than the logistic regression model. Therefore you choose to try the Extreme Gradient Boosting (XGBoost) instead. This is because while random forest builds many trees independently and averages them (bagging), XGBoost builds the trees sequentially. XGBoost builds each new tree tries to correct the errors of the previous one (boosting). This makes it better at capturing the small nuances that a logistic regression might miss. 
+
+```{r}
+
+years_sort <- sort(unique(st_wf$FIRE_YEAR))
+
+# train on the first 5 years
+train_years <- 5
+
+# set target variable
+target <- "FIRE_OCC"
+
+# define the formula 
+formula <- as.factor(`FIRE_OCC`) ~ `PREV_1` + `PREV_3` + `AVG_LONG` + `AVG_LAT`
+
+# run time-aware cross-validation
+fold <- tibble(
+  train_end = years_sort[(train_years):(length(years_sort) - 2)], 
+  valid_year = years_sort[(train_years + 1):(length(years_sort) - 1)] 
+) %>%
+  mutate(
+    # logistic regression
+    auc_glm = map2_dbl(train_end, 
+                        valid_year, 
+                        function(tr_end, va_year) {
+                          train <- st_wf %>%
+                            filter(`FIRE_YEAR` <= tr_end)
+                          valid <- st_wf %>%
+                            filter(`FIRE_YEAR` == va_year)
+                          
+                          fit <- glm(`FIRE_OCC` ~ `PREV_1` + `PREV_3` + `AVG_LONG` + `AVG_LAT`, 
+                                     data = train, 
+                                     family = "binomial")
+                          
+                          p_hat <- predict(fit, 
+                                           newdata = valid, 
+                                           type = "response")
+                          
+                          as.numeric(roc(valid[[target]], 
+                                         p_hat, 
+                                         quiet = TRUE)$auc)
+                        }), 
+    auc_rf = map2_dbl(train_end, 
+                        valid_year, 
+                        function(tr_end, va_year) {
+                          train <- st_wf %>%
+                            filter(`FIRE_YEAR` <= tr_end)
+                          valid <- st_wf %>%
+                            filter(`FIRE_YEAR` == va_year)
+                          
+                          fit <- randomForest(as.factor(`FIRE_OCC`) ~ `PREV_1` + `PREV_3` + `AVG_LONG` + `AVG_LAT`, 
+                                     data = train, 
+                                     importance = TRUE)
+                          
+                          p_hat <- predict(fit, 
+                                           newdata = valid, 
+                                           type = "prob")[, "1"]
+                          
+                          as.numeric(roc(valid[[target]], 
+                                         p_hat, 
+                                         quiet = TRUE)$auc)
+                        }), 
+    auc_rpart = map2_dbl(train_end, 
+                        valid_year, 
+                        function(tr_end, va_year) {
+                          train <- st_wf %>%
+                            filter(`FIRE_YEAR` <= tr_end)
+                          valid <- st_wf %>%
+                            filter(`FIRE_YEAR` == va_year)
+                          
+                          fit <- rpart(as.factor(`FIRE_OCC`) ~ `PREV_1` + `PREV_3` + `AVG_LONG` + `AVG_LAT`, 
+                                     data = train, 
+                                     method = "class",
+                                     control = rpart.control(cp = 0.01))
+                          
+                          p_hat <- predict(fit, 
+                                           newdata = valid, 
+                                           type = "prob")[, "1"]
+                          
+                          as.numeric(roc(valid[[target]], 
+                                         p_hat, 
+                                         quiet = TRUE)$auc)
+                        })
+    
+  )
+
+fold
+
+
+# pivot results to be able to plot
+fold_long <- fold %>%
+  pivot_longer(
+    cols = c(auc_glm, auc_rf, auc_rpart), 
+    names_to = "model", 
+    values_to = "auc"
+  )
+# check
+fold_long
+
+# create line plot
+ggplot(fold_long, aes(x = valid_year, y = auc, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Time-aware cross-validation diagnostic: AUC by validation year",
+    x = "Validation year",
+    y = "AUC",
+    color = "Model"
+  ) + 
+  theme_minimal()
+
+
+```
+
+
+
