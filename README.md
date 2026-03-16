@@ -1,0 +1,1 @@
+This github repository contains the RMD and HTML files of the wildfires prediction project for STA 141A. The Raw_code_and_notes.Rmd file is a sort of draft. The final version of my project can be accessed through both Final_project_description RMD and HTML files. 
